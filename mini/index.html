@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mini Militia Classic Remake</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+        body { background: #111; color: #fff; font-family: Tahoma, sans-serif; overflow: hidden; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; }
+        canvas { background: #5c94fc; border: 4px solid #333; box-shadow: 0 10px 30px rgba(0,0,0,0.8); cursor: crosshair; }
+        #ui-overlay { position: absolute; top: 15px; width: 800px; display: flex; justify-content: space-between; padding: 0 20px; pointer-events: none; font-size: 18px; font-weight: bold; text-shadow: 2px 2px #000; z-index: 10; }
+        .bar-container { width: 150px; height: 16px; background: rgba(0,0,0,0.5); border: 2px solid #fff; border-radius: 8px; overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 8px; }
+        .bar-fill { height: 100%; transition: width 0.1s; }
+        #hp-fill { background: #e74c3c; width: 100%; }
+        #fuel-fill { background: #f1c40f; width: 100%; }
+        #controls-hint { position: absolute; bottom: 10px; font-size: 13px; color: #ccc; background: rgba(0,0,0,0.7); padding: 5px 15px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+
+    <div id="ui-overlay">
+        <div>
+            <span>الصحة:</span> <div class="bar-container"><div id="hp-fill" class="bar-fill"></div></div>
+            <span>الوقود:</span> <div class="bar-container"><div id="fuel-fill" class="bar-fill"></div></div>
+        </div>
+        <div>النتيجة: <span id="score-val">0</span> | السلاح: <span id="weapon-val">Assault Rifle</span></div>
+    </div>
+
+    <canvas id="gameCanvas" width="800" height="500"></canvas>
+    
+    <div id="controls-hint">التحرك: WASD أو الأسهم | التصويب وإطلاق النار: الفأرة | القنبلة: زر G | تبديل السلاح: Q / E</div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+// UI Elements
+const hpFill = document.getElementById('hp-fill');
+const fuelFill = document.getElementById('fuel-fill');
+const scoreVal = document.getElementById('score-val');
+const weaponVal = document.getElementById('weapon-val');
+
+// Audio Context for Sound FX
+let audioCtx = null;
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function playSound(type) {
+    if (!audioCtx) return;
+    let osc = audioCtx.createOscillator();
+    let gain = audioCtx.createGain();
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    
+    let now = audioCtx.currentTime;
+    if (type === 'shoot') {
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(300, now);
+        osc.frequency.exponentialRampToValueAtTime(40, now + 0.1);
+        gain.gain.setValueAtTime(0.15, now);
+        gain.gain.linearRampToValueAtTime(0.01, now + 0.1);
+        osc.start(now);
+        osc.stop(now + 0.1);
+    } else if (type === 'explosion') {
+        osc.type = 'square';
+        osc.frequency.setValueAtTime(100, now);
+        osc.frequency.linearRampToValueAtTime(20, now + 0.4);
+        gain.gain.setValueAtTime(0.3, now);
+        gain.gain.linearRampToValueAtTime(0.01, now + 0.4);
+        osc.start(now);
+        osc.stop(now + 0.4);
+    }
+}
+
+// Game State
+let score = 0;
+let keys = {};
+let mouse = { x: 400, y: 250, down: false, rightDown: false };
+
+window.addEventListener('keydown', e => { keys[e.code] = true; initAudio(); });
+window.addEventListener('keyup', e => { keys[e.code] = false; });
+window.addEventListener('mousemove', e => {
+    let rect = canvas.getBoundingClientRect();
+    mouse.x = e.clientX - rect.left;
+    mouse.y = e.clientY - rect.top;
+});
+window.addEventListener('mousedown', e => {
+    initAudio();
+    if (e.button === 0) mouse.down = true;
+    if (e.button === 2) mouse.rightDown = true;
+});
+window.addEventListener('mouseup', e => {
+    if (e.button === 0) mouse.down = false;
+    if (e.button === 2) mouse.rightDown = false;
+});
+window.addEventListener('contextmenu', e => e.preventDefault());
+
+// Platforms Map
+const platforms = [
+    { x: 0, y: 460, w: 800, h: 40 }, // Ground
+    { x: 100, y: 340, w: 200, h: 20 },
+    { x: 500, y: 320, w: 220, h: 20 },
+    { x: 300, y: 220, w: 200, h: 20 },
+    { x: 150, y: 120, w: 150, h: 20 },
+    { x: 550, y: 130, w: 140, h: 20 }
+];
+
+// Weapons Catalog
+const weapons = {
+    assault: { name: 'Assault Rifle', fireRate: 12, damage: 15, speed: 12, spread: 0.05 },
+    shotgun: { name: 'Shotgun', fireRate: 40, damage: 10, speed: 10, spread: 0.25, pellets: 5 },
+    sniper: { name: 'Sniper Rifle', fireRate: 50, damage: 70, speed: 20, spread: 0.01 },
+    rocket: { name: 'Rocket Launcher', fireRate: 60, damage: 90, speed: 7, explosive: true }
+};
+
+let currentWeaponKey = 'assault';
+
+// Bullet class
+class Bullet {
+    constructor(x, y, vx, vy, damage, explosive, isEnemy) {
+        this.x = x; this.y = y; this.vx = vx; this.vy = vy;
+        this.damage = damage;
+        this.explosive = explosive;
+        this.isEnemy = isEnemy;
+        this.active = true;
+    }
+    update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        // Check bounds
+        if (this.x < 0 || this.x > 800 || this.y < 0 || this.y > 500) this.active = false;
+        // Check platform collision
+        platforms.forEach(p => {
+            if (this.x > p.x && this.x < p.x + p.w && this.y > p.y && this.y < p.y + p.h) {
+                if (this.explosive) createExplosion(this.x, this.y);
+                this.active = false;
+            }
+        });
+    }
+    draw() {
+        ctx.fillStyle = this.explosive ? '#e74c3c' : '#f1c40f';
+        ctx.beginPath(); ctx.arc(this.x, this.y, this.explosive ? 5 : 3, 0, Math.PI * 2); ctx.fill();
+    }
+}
+
+let bullets = [];
+let explosions = [];
+
+function createExplosion(x, y) {
+    playSound('explosion');
+    explosions.push({ x: x, y: y, r: 10, maxR: 50, alpha: 1 });
+    // Check damage to entities
+    let dist = Math.hypot(player.x - x, player.y - y);
+    if (dist < 50) player.hp -= 40;
+    bots.forEach(b => {
+        let bDist = Math.hypot(b.x - x, b.y - y);
+        if (bDist < 50) b.hp -= 50;
+    });
+}
+
+// Player Class
+class Player {
+    constructor(x, y) {
+        this.x = x; this.y = y;
+        this.w = 24; this.h = 36;
+        this.vx = 0; this.vy = 0;
+        this.speed = 3.5;
+        this.jumpPower = -7;
+        this.hp = 100;
+        this.maxHp = 100;
+        this.fuel = 100;
+        this.maxFuel = 100;
+        this.facing = 1;
+        this.shootTimer = 0;
+    }
+    update() {
+        // Horizontal Movement
+        if (keys['KeyA'] || keys['ArrowLeft']) { this.vx = -this.speed; this.facing = -1; }
+        else if (keys['KeyD'] || keys['ArrowRight']) { this.vx = this.speed; this.facing = 1; }
+        else { this.vx *= 0.8; }
+
+        // Jetpack / Fly
+        if ((keys['KeyW'] || keys['ArrowUp'] || keys['Space']) && this.fuel > 0) {
+            this.vy -= 0.45;
+            this.fuel = Math.max(0, this.fuel - 0.8);
+        } else {
+            this.vy += 0.35; // Gravity
+            if (this.fuel < this.maxFuel) this.fuel = Math.min(this.maxFuel, this.fuel + 0.3);
+        }
+
+        // Apply velocity & Collisions
+        this.x += this.vx;
+        this.y += this.vy;
+
+        // Platform collisions
+        platforms.forEach(p => {
+            if (this.x + this.w/2 > p.x && this.x - this.w/2 < p.x + p.w &&
+                this.y + this.h/2 > p.y && this.y - this.h/2 < p.y + p.h) {
+                // Coming from top
+                if (this.vy > 0 && this.y - this.h/2 + this.vy <= p.y) {
+                    this.y = p.y - this.h/2;
+                    this.vy = 0;
+                }
+            }
+        });
+
+        // Screen borders
+        if (this.x < 15) this.x = 15;
+        if (this.x > 785) this.x = 785;
+        if (this.y > 480) { this.y = 480; this.vy = 0; }
+
+        // Shooting
+        if (this.shootTimer > 0) this.shootTimer--;
+        if (mouse.down && this.shootTimer === 0) {
+            let weap = weapons[currentWeaponKey];
+            this.shootTimer = weap.fireRate;
+            playSound('shoot');
+            
+            let angle = Math.atan2(mouse.y - this.y, mouse.x - this.x);
+            let pellets = weap.pellets || 1;
+            for (let i = 0; i < pellets; i++) {
+                let spreadAngle = angle + (Math.random() - 0.5) * weap.spread;
+                bullets.push(new Bullet(
+                    this.x, this.y,
+                    Math.cos(spreadAngle) * weap.speed,
+                    Math.sin(spreadAngle) * weap.speed,
+                    weap.damage, weap.explosive, false
+                ));
+            }
+        }
+
+        // Weapon switching via Q / E
+        if (keys['KeyQ']) currentWeaponKey = 'assault';
+        if (keys['KeyE']) currentWeaponKey = 'shotgun';
+        if (keys['KeyR']) currentWeaponKey = 'sniper';
+        if (keys['KeyT']) currentWeaponKey = 'rocket';
+
+        // Update UI Bars
+        hpFill.style.width = Math.max(0, (this.hp / this.maxHp) * 100) + '%';
+        fuelFill.style.width = (this.fuel / this.maxFuel) * 100 + '%';
+        scoreVal.innerText = score;
+        weaponVal.innerText = weapons[currentWeaponKey].name;
+
+        if (this.hp <= 0) {
+            alert('لقد خسرت! النتيجة النهائية: ' + score);
+            document.location.reload();
+        }
+    }
+    draw() {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        // Body (Doodle style)
+        ctx.fillStyle = '#2ecc71';
+        ctx.fillRect(-this.w/2, -this.h/2, this.w, this.h);
+        // Head
+        ctx.fillStyle = '#f1c40f';
+        ctx.beginPath(); ctx.arc(0, -this.h/2 - 6, 10, 0, Math.PI * 2); ctx.fill();
+        // Helmet
+        ctx.fillStyle = '#27ae60';
+        ctx.beginPath(); ctx.arc(0, -this.h/2 - 8, 10, Math.PI, Math.PI * 2); ctx.fill();
+        ctx.restore();
+    }
+}
+
+// Bot Class (AI Enemy)
+class Bot {
+    constructor(x, y) {
+        this.x = x; this.y = y;
+        this.w = 24; this.h = 36;
+        this.vx = 0; this.vy = 0;
+        this.hp = 60;
+        this.shootTimer = 0;
+    }
+    update() {
+        // AI Tracking Player
+        let dx = player.x - this.x;
+        let dy = player.y - this.y;
+        let dist = Math.hypot(dx, dy);
+
+        if (dx > 10) { this.vx = 1.5; }
+        else if (dx < -10) { this.vx = -1.5; }
+        else { this.vx = 0; }
+
+        if (dy < -20 && Math.random() < 0.05) { this.vy -= 4; } // Fly up
+        this.vy += 0.35; // Gravity
+
+        this.x += this.vx;
+        this.y += this.vy;
+
+        // Platform collision
+        platforms.forEach(p => {
+            if (this.x + this.w/2 > p.x && this.x - this.w/2 < p.x + p.w &&
+                this.y + this.h/2 > p.y && this.y - this.h/2 < p.y + p.h) {
+                if (this.vy > 0 && this.y - this.h/2 + this.vy <= p.y) {
+                    this.y = p.y - this.h/2;
+                    this.vy = 0;
+                }
+            }
+        });
+        if (this.y > 480) { this.y = 480; this.vy = 0; }
+
+        // Bot Shooting
+        this.shootTimer++;
+        if (this.shootTimer > 70 && dist < 350) {
+            this.shootTimer = 0;
+            let angle = Math.atan2(dy, dx);
+            bullets.push(new Bullet(this.x, this.y, Math.cos(angle) * 8, Math.sin(angle) * 8, 15, false, true));
+        }
+    }
+    draw() {
+        ctx.save();
+        ctx.translate(this.x, this.y);
+        ctx.fillStyle = '#e74c3c'; // Enemy red color
+        ctx.fillRect(-this.w/2, -this.h/2, this.w, this.h);
+        ctx.fillStyle = '#f1c40f';
+        ctx.beginPath(); ctx.arc(0, -this.h/2 - 6, 10, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+    }
+}
+
+let player = new Player(100, 400);
+let bots = [new Bot(650, 100), new Bot(350, 100)];
+
+// Main Game Loop
+function loop() {
+    // Clear Screen
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Draw Platforms
+    ctx.fillStyle = '#34495e';
+    platforms.forEach(p => {
+        ctx.fillRect(p.x, p.y, p.w, p.h);
+        ctx.strokeStyle = '#2c3e50';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(p.x, p.y, p.w, p.h);
+    });
+
+    // Update & Draw Player
+    player.update();
+    player.draw();
+
+    // Update & Draw Bots
+    bots.forEach((b, index) => {
+        b.update();
+        b.draw();
+        // Check if player bullets hit bot
+        bullets.forEach(bul => {
+            if (!bul.isEnemy && Math.hypot(bul.x - b.x, bul.y - b.y) < 20) {
+                b.hp -= bul.damage;
+                bul.active = false;
+            }
+        });
+        // Check if bot bullets hit player
+        bullets.forEach(bul => {
+            if (bul.isEnemy && Math.hypot(bul.x - player.x, bul.y - player.y) < 20) {
+                player.hp -= bul.damage;
+                bul.active = false;
+            }
+        });
+        if (b.hp <= 0) {
+            bots.splice(index, 1);
+            score += 100;
+            // Respawn new bot after elimination
+            setTimeout(() => bots.push(new Bot(Math.random() * 700 + 50, 50)), 2000);
+        }
+    });
+
+    // Update & Draw Bullets
+    bullets.forEach(b => {
+        b.update();
+        if (b.active) b.draw();
+    });
+    bullets = bullets.filter(b => b.active);
+
+    // Update & Draw Explosions
+    explosions.forEach(ex => {
+        ex.r += 3;
+        ex.alpha -= 0.05;
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, ex.alpha);
+        ctx.fillStyle = '#e67e22';
+        ctx.beginPath(); ctx.arc(ex.x, ex.y, ex.r, 0, Math.PI * 2); ctx.fill();
+        ctx.restore();
+    });
+    explosions = explosions.filter(ex => ex.alpha > 0);
+
+    requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>
